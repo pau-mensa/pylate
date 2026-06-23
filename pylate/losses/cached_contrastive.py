@@ -54,7 +54,11 @@ def _backward_hook(
     """
     assert loss_obj.cache is not None
     assert loss_obj.random_states is not None
-    with torch.enable_grad():
+    # Trainer autocast normally covers loss.forward(), not the backward hook.
+    # Re-enter the pass-1 context so the recompute uses the same dtype and so
+    # fp32 master weights still feed bf16 activations through the full model
+    # (backbone and Dense head), exactly as they did in pass 1.
+    with loss_obj.recompute_autocast_context(), torch.enable_grad():
         for sentence_feature, grad, random_states in zip(
             sentence_features, loss_obj.cache, loss_obj.random_states
         ):
@@ -165,6 +169,16 @@ class CachedContrastive(nn.Module):
         self.cache: list[list[Tensor]] | None = None
         # Will hold random states for each chunk, so we can re-run the embedding pass with grads
         self.random_states: list[list[RandContext]] | None = None
+        self._autocast_device_type: str | None = None
+        self._autocast_dtype: torch.dtype | None = None
+
+    def recompute_autocast_context(self):
+        if self._autocast_device_type is None:
+            return nullcontext()
+        return torch.amp.autocast(
+            self._autocast_device_type,
+            dtype=self._autocast_dtype,
+        )
 
     def embed_minibatch(
         self,
@@ -346,6 +360,8 @@ class CachedContrastive(nn.Module):
         # Step (1): A quick embedding step without gradients/computation graphs to get all the embeddings
         reps = []
         self.random_states = []  # Copy random states to guarantee exact reproduction of the embeddings during the second forward pass, i.e. step (3)
+        self._autocast_device_type = None
+        self._autocast_dtype = None
         # handle the model being wrapped in (D)DP and so require to access module first
         skiplist = (
             self.model.skiplist
@@ -356,6 +372,11 @@ class CachedContrastive(nn.Module):
             sentence_features=sentence_features, skiplist=skiplist
         )
         for sentence_feature in sentence_features:
+            if self._autocast_device_type is None:
+                device_type = sentence_feature["input_ids"].device.type
+                if torch.is_autocast_enabled(device_type):
+                    self._autocast_device_type = device_type
+                    self._autocast_dtype = torch.get_autocast_dtype(device_type)
             reps_mbs = []
             random_state_mbs = []
             for reps_mb, random_state in self.embed_minibatch_iter(
